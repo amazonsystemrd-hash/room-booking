@@ -1277,6 +1277,10 @@ const SLOT_LABELS = SLOT_HOURS.map(h => `${String(h).padStart(2,'0')}:00`);
 /* Rooms — parent/child model (per implement-plan §2).
    Parent (Grand) is available only when *every* child is free at that slot.
    Booking the parent occupies all children simultaneously. */
+/* ROOMS / ALL_ROOM_IDS / CHILD_ROOM_IDS / PARENT_ROOM_IDS are seeded with
+   demo data and overwritten by loadAllData() when Supabase is configured.
+   They stay declared as `const` (objects/arrays are mutable through their
+   methods) so existing references throughout the file keep working. */
 const ROOMS = {
   SmallRoom_A: { id: 'SmallRoom_A', name: 'Studio A',  minCap: 1, maxCap: 7,  rate: 280, blurb: 'Compact, north-facing, fibre wifi, 4K display.', parentId: 'GrandRoom' },
   SmallRoom_B: { id: 'SmallRoom_B', name: 'Studio B',  minCap: 1, maxCap: 7,  rate: 280, blurb: 'Compact, mirrored to Studio A, whiteboard wall.', parentId: 'GrandRoom' },
@@ -1285,6 +1289,16 @@ const ROOMS = {
 const ALL_ROOM_IDS = ['SmallRoom_A', 'SmallRoom_B', 'GrandRoom'];
 const CHILD_ROOM_IDS = ALL_ROOM_IDS.filter(id => ROOMS[id].parentId);
 const PARENT_ROOM_IDS = ALL_ROOM_IDS.filter(id => !ROOMS[id].parentId && ALL_ROOM_IDS.some(c => ROOMS[c].parentId === id));
+/* Recompute the derived arrays after rooms are loaded from DB or modified.
+   We mutate in place (length=0 + push) so other references keep working. */
+function recomputeRoomMeta() {
+  ALL_ROOM_IDS.length = 0;
+  Object.keys(ROOMS).forEach(id => ALL_ROOM_IDS.push(id));
+  CHILD_ROOM_IDS.length = 0;
+  ALL_ROOM_IDS.filter(id => ROOMS[id].parentId).forEach(id => CHILD_ROOM_IDS.push(id));
+  PARENT_ROOM_IDS.length = 0;
+  ALL_ROOM_IDS.filter(id => !ROOMS[id].parentId && ALL_ROOM_IDS.some(c => ROOMS[c].parentId === id)).forEach(id => PARENT_ROOM_IDS.push(id));
+}
 function childrenOf(parentId) { return ALL_ROOM_IDS.filter(id => ROOMS[id].parentId === parentId); }
 
 /* ── Parent-Child booking constraints ─────────────────────────────────────
@@ -2027,12 +2041,16 @@ async function loadAllData() {
     state.screen = 'app';
 
     // ── Step 3: Load all data tables from Supabase ──────────────────────
-    const [bRes, boRes, blRes, aRes, auRes] = await Promise.all([
+    const [bRes, boRes, blRes, aRes, auRes, rRes, cRes, pRes, cfgRes] = await Promise.all([
       db.from('bookings').select('*').order('created_at', { ascending: false }),
       db.from('blockouts').select('*').order('id',         { ascending: true  }),
       db.from('blacklist').select('*'),
       db.from('admins').select('*'),
       db.from('audit').select('*').order('ts',             { ascending: false }).limit(500),
+      db.from('rooms').select('*').order('sort_order',     { ascending: true  }),
+      db.from('catering_categories').select('*').order('sort_order', { ascending: true }),
+      db.from('catering_products').select('*').order('sort_order',   { ascending: true }),
+      db.from('app_config').select('*'),
     ]);
 
     if (bRes.error)  throw new Error('bookings: '  + bRes.error.message);
@@ -2040,12 +2058,40 @@ async function loadAllData() {
     if (blRes.error) throw new Error('blacklist: ' + blRes.error.message);
     if (aRes.error)  throw new Error('admins: '    + aRes.error.message);
     if (auRes.error) throw new Error('audit: '     + auRes.error.message);
+    if (rRes.error)  throw new Error('rooms: '     + rRes.error.message);
+    if (cRes.error)  throw new Error('catering_categories: ' + cRes.error.message);
+    if (pRes.error)  throw new Error('catering_products: '   + pRes.error.message);
+    if (cfgRes.error) throw new Error('app_config: ' + cfgRes.error.message);
 
     api.bookings  = (bRes.data  || []).map(rowToBooking);
     api.blockouts = (boRes.data || []).map(rowToBlockout);
     api.blacklist = (blRes.data || []).map(r => ({ email: r.email, reason: r.reason || '' }));
     api.admins    = (aRes.data  || []).map(r => ({ email: r.email, addedAt: r.added_at || r.addedAt || '' }));
     api.audit     = (auRes.data || []).map(r => ({ ts: r.ts, actor: r.actor, action: r.action, detail: r.detail, result: r.result }));
+
+    // Replace ROOMS contents (preserve the `const` reference)
+    if (rRes.data && rRes.data.length > 0) {
+      Object.keys(ROOMS).forEach(k => delete ROOMS[k]);
+      rRes.data.forEach(r => { const room = rowToRoom(r); ROOMS[room.id] = room; });
+      recomputeRoomMeta();
+    }
+
+    // Replace CATS contents (preserve the `const` reference)
+    if (cRes.data && cRes.data.length > 0) {
+      CATS.length = 0;
+      cRes.data.forEach(r => CATS.push(r.name));
+    }
+
+    // Replace PRODUCTS contents (preserve the `const` reference)
+    if (pRes.data && pRes.data.length > 0) {
+      PRODUCTS.length = 0;
+      pRes.data.forEach(r => PRODUCTS.push(rowToProduct(r)));
+    }
+
+    // Overlay app_config rows onto CONFIG (only known keys; ignore unknown)
+    (cfgRes.data || []).forEach(r => {
+      if (r.key in CONFIG) CONFIG[r.key] = r.value;
+    });
 
     // Sync the ADMINS Set used by isAdminUser() with the DB values.
     ADMINS.clear();
@@ -2134,6 +2180,99 @@ async function dbInsertAudit(entry) {
     detail: entry.detail, result: entry.result,
   }]);
   if (error) console.error('[DB] insert audit', error); // Audit failures are silent — don't alert the user
+}
+
+/* ── Rooms ──────────────────────────────────────────────────────────── */
+function rowToRoom(r) {
+  return {
+    id: r.id, name: r.name,
+    minCap: r.min_cap, maxCap: r.max_cap, rate: Number(r.rate),
+    blurb: r.blurb || '', parentId: r.parent_id || null,
+  };
+}
+async function dbInsertRoom(r) {
+  if (!db) return;
+  const { error } = await db.from('rooms').insert([{
+    id: r.id, name: r.name, min_cap: r.minCap, max_cap: r.maxCap,
+    rate: r.rate, blurb: r.blurb || '', parent_id: r.parentId || null,
+  }]);
+  if (error) { console.error('[DB] insert room', error); showToast('Warning: room may not have saved', 'error'); }
+}
+async function dbUpdateRoom(id, fields) {
+  if (!db) return;
+  // Map app field names → DB column names (camelCase → snake_case)
+  const dbFields = {};
+  if (fields.name     !== undefined) dbFields.name      = fields.name;
+  if (fields.minCap   !== undefined) dbFields.min_cap   = fields.minCap;
+  if (fields.maxCap   !== undefined) dbFields.max_cap   = fields.maxCap;
+  if (fields.rate     !== undefined) dbFields.rate      = fields.rate;
+  if (fields.blurb    !== undefined) dbFields.blurb     = fields.blurb;
+  if (fields.parentId !== undefined) dbFields.parent_id = fields.parentId;
+  const { error } = await db.from('rooms').update(dbFields).eq('id', id);
+  if (error) { console.error('[DB] update room', error); showToast('Warning: room edit may not have saved', 'error'); }
+}
+
+/* ── Catering categories ────────────────────────────────────────────── */
+async function dbInsertCategory(name, order) {
+  if (!db) return;
+  const { error } = await db.from('catering_categories').insert([{ name, sort_order: order || 0 }]);
+  if (error) { console.error('[DB] insert category', error); showToast('Warning: category may not have saved', 'error'); }
+}
+async function dbRenameCategory(oldName, newName) {
+  if (!db) return;
+  const { error: e1 } = await db.from('catering_categories').update({ name: newName }).eq('name', oldName);
+  if (e1) { console.error('[DB] rename category', e1); showToast('Warning: rename may not have saved', 'error'); return; }
+  const { error: e2 } = await db.from('catering_products').update({ cat: newName }).eq('cat', oldName);
+  if (e2) console.error('[DB] cascade product cat', e2);
+}
+async function dbDeleteCategory(name) {
+  if (!db) return;
+  const { error: e1 } = await db.from('catering_products').delete().eq('cat', name);
+  if (e1) console.error('[DB] cascade delete products', e1);
+  const { error: e2 } = await db.from('catering_categories').delete().eq('name', name);
+  if (e2) { console.error('[DB] delete category', e2); showToast('Warning: delete may not have saved', 'error'); }
+}
+
+/* ── Catering products ──────────────────────────────────────────────── */
+function rowToProduct(r) {
+  return {
+    id: r.id, cat: r.cat, name: r.name, price: Number(r.price),
+    desc: r.description || '', enabled: r.enabled !== false,
+  };
+}
+async function dbInsertProduct(p) {
+  if (!db) return;
+  const { error } = await db.from('catering_products').insert([{
+    id: p.id, cat: p.cat, name: p.name, price: p.price,
+    description: p.desc || '', enabled: p.enabled !== false,
+  }]);
+  if (error) { console.error('[DB] insert product', error); showToast('Warning: product may not have saved', 'error'); }
+}
+async function dbUpdateProduct(id, fields) {
+  if (!db) return;
+  const dbFields = {};
+  if (fields.cat     !== undefined) dbFields.cat         = fields.cat;
+  if (fields.name    !== undefined) dbFields.name        = fields.name;
+  if (fields.price   !== undefined) dbFields.price       = fields.price;
+  if (fields.desc    !== undefined) dbFields.description = fields.desc;
+  if (fields.enabled !== undefined) dbFields.enabled     = fields.enabled;
+  const { error } = await db.from('catering_products').update(dbFields).eq('id', id);
+  if (error) { console.error('[DB] update product', error); showToast('Warning: product edit may not have saved', 'error'); }
+}
+async function dbDeleteProduct(id) {
+  if (!db) return;
+  const { error } = await db.from('catering_products').delete().eq('id', id);
+  if (error) { console.error('[DB] delete product', error); showToast('Warning: product delete may not have saved', 'error'); }
+}
+
+/* ── App config (key-value with jsonb) ──────────────────────────────── */
+async function dbUpsertConfig(updates) {
+  // updates: { keyName: value, ... } — any JSON-serialisable value
+  if (!db) return;
+  const rows = Object.entries(updates).map(([key, value]) => ({ key, value }));
+  if (rows.length === 0) return;
+  const { error } = await db.from('app_config').upsert(rows, { onConflict: 'key' });
+  if (error) { console.error('[DB] upsert config', error); showToast('Warning: settings may not have saved', 'error'); }
 }
 
 // Quick refresh of just the Continue button's disabled state without any
@@ -5530,11 +5669,14 @@ function handleAction(action, target, ev) {
       const before = { name: r.name, minCap: r.minCap, maxCap: r.maxCap, rate: r.rate, parentId: r.parentId || null, blurb: r.blurb || '' };
       const after  = { name, minCap, maxCap, rate, parentId: newParent, blurb: String(d.blurb || '').trim() };
       Object.assign(r, after);
+      recomputeRoomMeta();
       api.audit.unshift({
         ts: new Date().toISOString(), actor: CURRENT_USER.email,
         action: 'updateRoom', detail: `${id}: ${JSON.stringify({ before, after })}`,
         result: 'SUCCESS'
       });
+      dbUpdateRoom(id, after);
+      dbInsertAudit(api.audit[0]);
       state.detailModal = { kind: 'room', record: r, title: `Room ${r.name}` };
       render();
       showToast('Room updated');
@@ -5574,8 +5716,10 @@ function handleAction(action, target, ev) {
       if (Object.keys(errs).length) { m.errors = errs; render(); break; }
       const newRoom = { id, name, minCap, maxCap, rate, blurb: String(d.blurb || '').trim(), parentId: d.parentId || null };
       ROOMS[id] = newRoom;
-      ALL_ROOM_IDS.push(id);
+      recomputeRoomMeta();
       api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'addRoom', detail: `${id} (${name})`, result: 'SUCCESS' });
+      dbInsertRoom(newRoom);
+      dbInsertAudit(api.audit[0]);
       state.detailModal = null;
       render();
       showToast(`Room "${name}" added`);
@@ -5848,9 +5992,11 @@ function handleAction(action, target, ev) {
     /* Catering: master toggles */
     case 'toggle-catering-cfg': {
       const key = target.getAttribute('data-key');
-      if (key === 'cateringEnabled') CONFIG.cateringEnabled = target.checked;
+      if (key === 'cateringEnabled')  CONFIG.cateringEnabled  = target.checked;
       if (key === 'cateringMandatory') CONFIG.cateringMandatory = target.checked;
       api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'updateCateringCfg', detail: `${key}=${target.checked}`, result: 'SUCCESS' });
+      dbUpsertConfig({ [key]: target.checked });
+      dbInsertAudit(api.audit[0]);
       render(); break;
     }
 
@@ -5884,13 +6030,16 @@ function handleAction(action, target, ev) {
       if (m.mode === 'create') {
         CATS.push(name);
         state.cateringCat = name;
+        dbInsertCategory(name, CATS.length);
       } else {
         const idx = CATS.indexOf(m.cat);
         if (idx >= 0) CATS[idx] = name;
         PRODUCTS.forEach(p => { if (p.cat === m.cat) p.cat = name; });
         if (state.cateringCat === m.cat) state.cateringCat = name;
+        dbRenameCategory(m.cat, name);
       }
       api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: m.mode === 'create' ? 'addCateringCat' : 'renameCateringCat', detail: name, result: 'SUCCESS' });
+      dbInsertAudit(api.audit[0]);
       state.detailModal = null;
       render();
       showToast(m.mode === 'create' ? `Category "${name}" added` : `Renamed to "${name}"`);
@@ -5905,6 +6054,8 @@ function handleAction(action, target, ev) {
       }
       if (state.cateringCat === cat) state.cateringCat = CATS[0] || null;
       api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'deleteCateringCat', detail: cat, result: 'SUCCESS' });
+      dbDeleteCategory(cat);
+      dbInsertAudit(api.audit[0]);
       state.detailModal = null;
       render();
       showToast(`"${cat}" deleted`);
@@ -5943,15 +6094,22 @@ function handleAction(action, target, ev) {
       if (!cat || !CATS.includes(cat)) errs.cat = 'Select a category.';
       if (Object.keys(errs).length) { m.errors = errs; render(); break; }
       if (m.mode === 'create') {
-        PRODUCTS.push({ id: 'p' + Date.now(), cat, name, price, desc: String(d.desc || '').trim(), enabled: d.enabled !== false });
+        const newProduct = { id: 'p' + Date.now(), cat, name, price, desc: String(d.desc || '').trim(), enabled: d.enabled !== false };
+        PRODUCTS.push(newProduct);
         state.cateringCat = cat;
         api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'addCateringProduct', detail: name, result: 'SUCCESS' });
+        dbInsertProduct(newProduct);
+        dbInsertAudit(api.audit[0]);
         showToast(`"${name}" added`);
       } else {
         const p = PRODUCTS.find(x => x.id === m.pid);
-        if (p) { p.name = name; p.price = price; p.desc = String(d.desc || '').trim(); p.cat = cat; p.enabled = d.enabled !== false; }
+        if (p) {
+          p.name = name; p.price = price; p.desc = String(d.desc || '').trim(); p.cat = cat; p.enabled = d.enabled !== false;
+          dbUpdateProduct(m.pid, { cat, name, price, desc: p.desc, enabled: p.enabled });
+        }
         state.cateringCat = cat;
         api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'updateCateringProduct', detail: name, result: 'SUCCESS' });
+        dbInsertAudit(api.audit[0]);
         showToast(`"${name}" updated`);
       }
       state.detailModal = null;
@@ -5963,6 +6121,8 @@ function handleAction(action, target, ev) {
       const idx = PRODUCTS.findIndex(x => x.id === pid);
       if (idx >= 0) PRODUCTS.splice(idx, 1);
       api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'deleteCateringProduct', detail: p ? p.name : pid, result: 'SUCCESS' });
+      dbDeleteProduct(pid);
+      dbInsertAudit(api.audit[0]);
       state.detailModal = null; // close the product view modal after deletion
       render();
       showToast(p ? `"${p.name}" deleted` : 'Product deleted');
@@ -5971,7 +6131,12 @@ function handleAction(action, target, ev) {
     case 'toggle-product': {
       const pid = target.getAttribute('data-pid');
       const p = PRODUCTS.find(x => x.id === pid);
-      if (p) { p.enabled = !p.enabled; render(); showToast(p.enabled ? `"${p.name}" active` : `"${p.name}" hidden`); }
+      if (p) {
+        p.enabled = !p.enabled;
+        dbUpdateProduct(pid, { enabled: p.enabled });
+        render();
+        showToast(p.enabled ? `"${p.name}" active` : `"${p.name}" hidden`);
+      }
       break;
     }
 
@@ -5979,8 +6144,11 @@ function handleAction(action, target, ev) {
     case 'save-brand': {
       const v = state.brandValues || {};
       const BRAND_KEYS = ['logoMarkUrl','brandName','brandSub','brandCopyright','loginBgImage','loginBgColor','loginMobileBgImage','loginEyebrow','loginHeadline','loginLede','loginBullet0','loginBullet1','loginBullet2','loginFooter'];
-      BRAND_KEYS.forEach(k => { if (v[k] !== undefined) { CONFIG[k] = v[k]; delete v[k]; } });
+      const persisted = {};
+      BRAND_KEYS.forEach(k => { if (v[k] !== undefined) { CONFIG[k] = v[k]; persisted[k] = v[k]; delete v[k]; } });
       api.audit.unshift({ ts: new Date().toISOString(), actor: CURRENT_USER.email, action: 'updateBrand', detail: 'Login page brand visual updated', result: 'SUCCESS' });
+      dbUpsertConfig(persisted);
+      dbInsertAudit(api.audit[0]);
       render();
       showToast('Brand visual saved');
       break;
@@ -6005,6 +6173,8 @@ function handleAction(action, target, ev) {
         action: 'updateConfig', detail: `min=${minDays}, max=${maxDays}`,
         result: 'SUCCESS'
       });
+      dbUpsertConfig({ nonAdminMinDays: minDays, nonAdminMaxDays: maxDays });
+      dbInsertAudit(api.audit[0]);
       state.configValues = null;
       state.configErrors = null;
       render();
@@ -6024,9 +6194,11 @@ function handleAction(action, target, ev) {
         'faq':          ['helpEyebrow', 'helpTitle', 'helpDesc', 'faqs'],
       }[section] || [];
       let changed = 0;
+      const persisted = {};
       sectionKeys.forEach(k => {
         if (v[k] !== undefined) {
           CONFIG[k] = v[k];
+          persisted[k] = v[k];
           delete v[k];
           changed++;
         }
@@ -6036,6 +6208,8 @@ function handleAction(action, target, ev) {
         action: 'updateText', detail: `section=${section} (${changed} field${changed === 1 ? '' : 's'})`,
         result: 'SUCCESS'
       });
+      dbUpsertConfig(persisted);
+      dbInsertAudit(api.audit[0]);
       render();
       showToast('Saved successfully');
       break;
