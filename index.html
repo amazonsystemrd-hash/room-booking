@@ -1191,8 +1191,8 @@
    The app works without a DB (uses built-in demo data) if you leave
    these as the placeholder strings.
 ──────────────────────────────────────────────────────────────────── */
-const SUPABASE_URL = 'https://uknnobnfblyoquajzdzk.supabase.co'; // e.g. https://abcxyz.supabase.co
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVrbm5vYm5mYmx5b3F1YWp6ZHprIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0NjI1NTQsImV4cCI6MjA5NDAzODU1NH0.3Bb-_40RvlGzxSmNKe4lh5QTmCcBSokEbqDyfRpCCq4';    // starts with eyJ…
+const SUPABASE_URL = 'https://uknnobnfblyoquajzdzk.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVrbm5vYm5mYmx5b3F1YWp6ZHprIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0NjI1NTQsImV4cCI6MjA5NDAzODU1NH0.3Bb-_40RvlGzxSmNKe4lh5QTmCcBSokEbqDyfRpCCq4';
 
 // db is null when unconfigured or when SDK failed to load — the app
 // automatically falls back to its built-in mock data in that case.
@@ -1477,8 +1477,10 @@ const CONFIG = {
   ],
 };
 
-const CURRENT_USER = { email: 'sora.t@gmail.com', name: 'Sora Tanaka', initials: 'S' };
-const ADMINS = new Set(['admin@example.com', 'sora.t@gmail.com']); // demo: current user is admin
+/* CURRENT_USER is populated from the Supabase auth session in loadAllData().
+   Falls back to the demo account when Supabase is not configured. */
+const CURRENT_USER = { email: '', name: '', initials: '' };
+const ADMINS = new Set(['admin@example.com']); // seed; loadAllData() syncs this from the DB
 function isAdminUser(email) { return ADMINS.has((email || '').toLowerCase()); }
 
 /* In-memory mock api. Real backend would replace these with fetch() calls. */
@@ -1984,15 +1986,47 @@ function rowToBlockout(r) {
   return { id: r.id, room: r.room, date: r.date, start: r.start || '', end: r.end || '', reason: r.reason || '' };
 }
 
+/* Helper: populate CURRENT_USER from a Supabase auth User object. */
+function applySession(user) {
+  const meta = user.user_metadata || {};
+  const name = meta.full_name || meta.name || user.email.split('@')[0];
+  const initials = name.split(' ').filter(Boolean).map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  CURRENT_USER.email    = user.email;
+  CURRENT_USER.name     = name;
+  CURRENT_USER.initials = initials || '?';
+}
+
 async function loadAllData() {
   if (!db) {
-    // Supabase not configured — use built-in demo data, show app immediately.
+    // Supabase not configured — run as demo with hardcoded mock user.
+    CURRENT_USER.email    = 'sora.t@gmail.com';
+    CURRENT_USER.name     = 'Sora Tanaka';
+    CURRENT_USER.initials = 'S';
+    ADMINS.add('sora.t@gmail.com');
     state.loading   = false;
     state.loadError = '';
     render();
     return;
   }
   try {
+    // ── Step 1: Check auth session (also processes OAuth redirect tokens) ──
+    const { data: { session }, error: authErr } = await db.auth.getSession();
+    if (authErr) throw authErr;
+
+    if (!session || !session.user) {
+      // Not signed in — show the login screen, nothing else to load.
+      state.loading   = false;
+      state.loadError = '';
+      state.screen    = 'login';
+      render();
+      return;
+    }
+
+    // ── Step 2: Set CURRENT_USER from Google profile ────────────────────
+    applySession(session.user);
+    state.screen = 'app';
+
+    // ── Step 3: Load all data tables from Supabase ──────────────────────
     const [bRes, boRes, blRes, aRes, auRes] = await Promise.all([
       db.from('bookings').select('*').order('created_at', { ascending: false }),
       db.from('blockouts').select('*').order('id',         { ascending: true  }),
@@ -2270,6 +2304,7 @@ function renderSideNav(routeKind) {
         ${routeKind === 'admin'
           ? `<button class="btn btn-ghost btn-sm btn-full" data-action="route-user">${icon('back', 14)} Back to booking</button>`
           : (isAdminUser(CURRENT_USER.email) ? `<button class="btn btn-ghost btn-sm btn-full" data-action="route-admin">${icon('settings', 14)} Admin console</button>` : '')}
+        <button class="btn btn-ghost btn-sm btn-full" data-action="sign-out" style="margin-top:4px;color:var(--text-muted);">${icon('logout', 14)} Sign out</button>
       </div>
     </aside>`;
 }
@@ -2289,18 +2324,19 @@ function renderTopBar() {
     </header>`;
 }
 
-/* User chip (plan §7): no logout button. Just identity + admin shortcut. */
 function renderUserChip(where) {
   const adminBtn = isAdminUser(CURRENT_USER.email) && state.route !== 'admin' && where === 'mobile'
     ? `<button class="user-chip-admin" data-action="route-admin" aria-label="Admin console">${icon('settings', 14)}</button>` : '';
+  const signOutBtn = where === 'mobile'
+    ? `<button class="user-chip-admin" data-action="sign-out" aria-label="Sign out" style="color:var(--text-muted);">${icon('logout', 14)}</button>` : '';
   return `
     <div class="user-chip ${where}">
-      <div class="avatar">${escapeHTML(CURRENT_USER.initials)}</div>
+      <div class="avatar">${escapeHTML(CURRENT_USER.initials || '?')}</div>
       <div class="nav-user">
-        <div class="nav-user-name">${escapeHTML(CURRENT_USER.name)}</div>
+        <div class="nav-user-name">${escapeHTML(CURRENT_USER.name || 'Signed in')}</div>
         <div class="nav-user-email">${escapeHTML(CURRENT_USER.email)}</div>
       </div>
-      ${adminBtn}
+      ${adminBtn}${signOutBtn}
     </div>`;
 }
 
@@ -5226,14 +5262,53 @@ function handleAction(action, target, ev) {
 
   switch (action) {
     case 'google-signin': {
+      if (!db) {
+        // Demo mode (no Supabase) — simulate login with mock user.
+        state.signingIn = true; render();
+        setTimeout(() => {
+          CURRENT_USER.email = 'sora.t@gmail.com';
+          CURRENT_USER.name = 'Sora Tanaka';
+          CURRENT_USER.initials = 'S';
+          ADMINS.add('sora.t@gmail.com');
+          state.signingIn = false;
+          state.screen = 'app';
+          state.route = 'user';
+          state.page = 'booking';
+          render();
+        }, 1400);
+        break;
+      }
+      // Real Google OAuth via Supabase — redirects browser to Google sign-in page.
       state.signingIn = true; render();
-      setTimeout(() => {
-        state.signingIn = false;
-        state.screen = 'app';
-        state.route = 'user';
-        state.page = 'booking';
+      db.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: window.location.href },
+      }).then(({ error }) => {
+        if (error) {
+          console.error('[Auth] signInWithOAuth error:', error);
+          state.signingIn = false;
+          state.loginError = true;
+          render();
+        }
+        // On success the browser navigates away to Google — no further action needed here.
+      });
+      break;
+    }
+    case 'sign-out': {
+      if (db) {
+        db.auth.signOut().then(() => {
+          CURRENT_USER.email = '';
+          CURRENT_USER.name  = '';
+          CURRENT_USER.initials = '';
+          state.screen = 'login';
+          state.route  = 'user';
+          state.page   = 'booking';
+          render();
+        });
+      } else {
+        state.screen = 'login';
         render();
-      }, 1400);
+      }
       break;
     }
     case 'toggle-login-error': state.loginError = !state.loginError; render(); break;
